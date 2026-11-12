@@ -86,8 +86,8 @@ def notify(product):
 
 def main():
     now = datetime.now(ZoneInfo('America/Chicago'))
-    if os.environ.get('GITHUB_EVENT_NAME') == 'schedule' and not (12 <= now.hour < 21 or (now.hour == 21 and now.minute <= 30)):
-        print('Outside 12:00–21:30 Central monitoring window; skipping')
+    if os.environ.get('GITHUB_EVENT_NAME') == 'schedule' and now.hour < 12:
+        print('Outside 12:00–00:00 Central monitoring window; skipping')
         return
     products = {}
     for feed in FEEDS:
