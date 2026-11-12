@@ -1,6 +1,11 @@
+"""Hatch Golf New Releases monitor; standard library only.
+
+First run of this version initializes release_seen_ids without alerts.
+Subsequent runs alert on ANY product newly appearing in New Releases,
+regardless of product category. Existing seen_ids are preserved.
+"""
 import json
 import os
-import re
 import sys
 import time
 from datetime import datetime
@@ -10,112 +15,178 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
-BASE = 'https://www.hatchgolf.com'
-STATE = Path('hatch-products-seen.json')
-FEEDS = ['/products.json', '/collections/new-releases/products.json']
-COVER = re.compile(r'head\s*cover|headcover|driver cover|fairway cover|hybrid cover|mallet cover|blade cover|putter cover|wood cover', re.I)
+BASE = "https://www.hatchgolf.com"
+STATE = Path("hatch-products-seen.json")
+RELEASES = "/collections/new-releases/products.json"
+CATALOG = "/products.json"
+PAGE_SIZE = 250
+MAX_PAGES = 30
+
 
 def get_json(url, attempts=3):
     for attempt in range(attempts):
         try:
-            req = Request(url, headers={'User-Agent': 'Mozilla/5.0 (compatible; HatchReleaseMonitor/1.0)', 'Accept': 'application/json'})
-            with urlopen(req, timeout=25) as response:
+            request = Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (compatible; HatchReleaseMonitor/2.0)",
+                "Accept": "application/json",
+            })
+            with urlopen(request, timeout=25) as response:
                 return json.load(response)
         except (HTTPError, URLError, TimeoutError, ValueError) as exc:
             if attempt == attempts - 1:
-                raise RuntimeError(f'Could not fetch {url}: {exc}') from exc
+                raise RuntimeError(f"Cannot retrieve {url}: {exc}") from exc
             time.sleep(2 * (attempt + 1))
 
+
 def load_feed(path):
-    products = {}
-    for page in range(1, 21):
-        url = f'{BASE}{path}?{urlencode({"limit": 250, "page": page})}'
-        payload = get_json(url)
-        batch = payload.get('products')
+    found = {}
+    for page in range(1, MAX_PAGES + 1):
+        query = urlencode({"limit": PAGE_SIZE, "page": page})
+        payload = get_json(f"{BASE}{path}?{query}")
+        batch = payload.get("products")
         if not isinstance(batch, list):
-            raise RuntimeError(f'Unexpected response from {url}')
-        for p in batch:
-            if 'id' in p:
-                products[str(p['id'])] = p
-        if len(batch) < 250:
-            return products
-    raise RuntimeError(f'Feed pagination limit reached for {path}; refusing partial snapshot')
+            raise RuntimeError(f"Unexpected product feed response: {path} page {page}")
+        for product in batch:
+            if product.get("id") is not None:
+                found[str(product["id"])] = product
+        if len(batch) < PAGE_SIZE:
+            return found
+    raise RuntimeError(f"Feed exceeds {MAX_PAGES} pages: {path}; refusing partial snapshot")
 
-def is_cover(product):
-    return bool(COVER.search(' '.join(str(product.get(k) or '') for k in ('title', 'product_type', 'tags'))))
 
-def club_type(product):
-    title = str(product.get('title', '')).lower()
-    for label, terms in [('Mallet', ['mallet']), ('Hybrid', ['hybrid']), ('Fairway', ['fairway', '3 wood', '3-wood']), ('Driver', ['driver']), ('Blade putter', ['blade']), ('Putter', ['putter']), ('Wood', ['wood'])]:
-        if any(term in title for term in terms):
+def category(product):
+    title = str(product.get("title") or "").lower()
+    ptype = str(product.get("product_type") or "").lower()
+    name = f"{title} {ptype}"
+    categories = [
+        ("Driver", ("driver",)),
+        ("Fairway", ("fairway", "3 wood", "3-wood")),
+        ("Hybrid", ("hybrid",)),
+        ("Mallet", ("mallet",)),
+        ("Blade", ("blade",)),
+        ("Putter", ("putter",)),
+        ("Hoodie", ("hoodie", "hooded sweatshirt")),
+        ("Hat", ("hat", "cap", "snapback", "headwear")),
+        ("Ball marker", ("ball marker", "ballmarker", "marker")),
+        ("Headcover", ("headcover", "head cover")),
+        ("Apparel", ("shirt", "tee", "polo", "jacket", "sweatshirt")),
+    ]
+    for label, words in categories:
+        if any(word in name for word in words):
             return label
-    return 'Headcover / set'
+    return ptype.title() if ptype else "New release"
 
-def product_price(product):
-    variants = product.get('variants') or []
-    prices = sorted({float(v['price']) for v in variants if v.get('price') is not None})
-    if not prices:
-        return 'Price unavailable'
-    return f'${prices[0]:,.2f}' + (f'–${prices[-1]:,.2f}' if len(prices) > 1 else '')
+
+def price(product):
+    amounts = []
+    for variant in product.get("variants") or []:
+        try:
+            amounts.append(float(variant["price"]))
+        except (KeyError, ValueError, TypeError):
+            continue
+    if not amounts:
+        return "Price unavailable"
+    low, high = min(amounts), max(amounts)
+    return f"${low:,.2f}" if low == high else f"${low:,.2f}–${high:,.2f}"
+
 
 def availability(product):
-    variants = product.get('variants') or []
+    variants = product.get("variants") or []
     if not variants:
-        return 'Availability unknown'
-    return 'Available' if any(v.get('available') for v in variants) else 'Sold out'
+        return "Availability unknown"
+    return "Available" if any(v.get("available") for v in variants) else "Sold out"
+
 
 def notify(product):
-    token = os.environ.get('PUSHOVER_API_TOKEN')
-    user = os.environ.get('PUSHOVER_USER_KEY')
+    token = os.environ.get("PUSHOVER_API_TOKEN")
+    user = os.environ.get("PUSHOVER_USER_KEY")
     if not token or not user:
-        raise RuntimeError('Pushover secrets missing')
-    title = str(product.get('title') or 'New Hatch Golf release')
-    handle = product.get('handle')
-    link = f'{BASE}/products/{handle}' if handle else BASE + '/collections/new-releases'
-    details = f'{club_type(product)} | {product_price(product)} | {availability(product)}'
-    data = urlencode({'token': token, 'user': user, 'title': 'NEW HATCH GOLF DROP', 'message': f'{title}\n{details}\n{link}', 'url': link, 'url_title': 'View product', 'priority': 2, 'retry': 30, 'expire': 120, 'sound': 'siren'}).encode()
-    req = Request('https://api.pushover.net/1/messages.json', data=data, method='POST')
+        raise RuntimeError("Missing PUSHOVER_API_TOKEN or PUSHOVER_USER_KEY secret")
+    title = str(product.get("title") or "New Hatch Golf release")
+    handle = product.get("handle")
+    link = f"{BASE}/products/{handle}" if handle else f"{BASE}/collections/new-releases"
+    message = f"{title}\n{category(product)} | {price(product)} | {availability(product)}\n{link}"
+    data = urlencode({
+        "token": token, "user": user,
+        "title": "NEW HATCH GOLF DROP", "message": message,
+        "url": link, "url_title": "View product",
+        "priority": 2, "retry": 30, "expire": 120, "sound": "siren",
+    }).encode()
+    request = Request("https://api.pushover.net/1/messages.json", data=data, method="POST")
     try:
-        with urlopen(req, timeout=25) as response:
+        with urlopen(request, timeout=25) as response:
             result = json.load(response)
-        if result.get('status') != 1:
-            raise RuntimeError(f'Pushover rejected notification: {result}')
     except (HTTPError, URLError, TimeoutError) as exc:
-        raise RuntimeError(f'Pushover notification failed for product {product.get("id")}: {exc}') from exc
-    print(f'Alert sent: {title}')
+        raise RuntimeError(f"Pushover failed for product {product.get('id')}: {exc}") from exc
+    if result.get("status") != 1:
+        raise RuntimeError(f"Pushover rejected alert for product {product.get('id')}: {result}")
+    print(f"Alert sent: {title}")
+
+
+def save_state(state):
+    temp = STATE.with_suffix(".tmp")
+    temp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temp.replace(STATE)
+
 
 def main():
-    now = datetime.now(ZoneInfo('America/Chicago'))
-    if os.environ.get('GITHUB_EVENT_NAME') == 'schedule' and now.hour < 12:
-        print('Outside 12:00–00:00 Central monitoring window; skipping')
+    local = datetime.now(ZoneInfo("America/Chicago"))
+    if os.environ.get("GITHUB_EVENT_NAME") == "schedule" and local.hour < 12:
+        print("Outside 12 PM–12 AM Central monitoring window; skipping")
         return
-    products = {}
-    for feed in FEEDS:
-        batch = load_feed(feed)
-        print(f'{feed}: {len(batch)} products')
-        products.update(batch)
-    if not products:
-        raise RuntimeError('Empty catalog; refusing to overwrite inventory')
-    current_ids = set(products)
-    if not STATE.exists():
-        STATE.write_text(json.dumps({'seen_ids': sorted(current_ids)}, indent=2) + '\n')
-        print(f'Baseline initialized with {len(current_ids)} products; no alerts')
-        return
-    old = json.loads(STATE.read_text())
-    seen = set(str(x) for x in old.get('seen_ids', []))
-    new = [p for pid, p in products.items() if pid not in seen and is_cover(p)]
-    print(f'{len(new)} new headcover listing(s) found')
-    # Send each notification before recording the ID. If a send fails, retry next run.
-    for p in sorted(new, key=lambda x: (club_type(x) not in ('Fairway', 'Hybrid', 'Mallet'), str(x.get('title')))):
-        notify(p)
-        seen.add(str(p['id']))
-        STATE.write_text(json.dumps({'seen_ids': sorted(seen | (current_ids - {str(q['id']) for q in new}))}, indent=2) + '\n')
-    seen.update(current_ids)
-    STATE.write_text(json.dumps({'seen_ids': sorted(seen)}, indent=2) + '\n')
 
-if __name__ == '__main__':
+    # The collection is the alert source. The full catalog is kept as an
+    # additional inventory reference, not a source of alerts by itself.
+    releases = load_feed(RELEASES)
+    print(f"New Releases: {len(releases)} products")
+    if not releases:
+        raise RuntimeError("New Releases returned zero products; refusing to reset baseline")
+    catalog = load_feed(CATALOG)
+    print(f"Full catalog: {len(catalog)} products")
+    if not catalog:
+        raise RuntimeError("Full catalog returned zero products; refusing to reset baseline")
+
+    all_ids = set(catalog) | set(releases)
+    release_ids = set(releases)
+    if STATE.exists():
+        state = json.loads(STATE.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            raise RuntimeError("Invalid inventory state; refusing to overwrite")
+    else:
+        state = {}
+
+    # Migration from the earlier headcover-only monitor: preserve the
+    # historical IDs, but baseline collection membership without alert spam.
+    if "release_seen_ids" not in state:
+        state["seen_ids"] = sorted(set(map(str, state.get("seen_ids", []))) | all_ids)
+        state["release_seen_ids"] = sorted(release_ids)
+        save_state(state)
+        print(f"New Releases baseline initialized: {len(release_ids)} products; no alerts")
+        return
+
+    seen_releases = set(map(str, state["release_seen_ids"]))
+    seen_catalog = set(map(str, state.get("seen_ids", [])))
+    new = [p for pid, p in releases.items() if pid not in seen_releases]
+    print(f"New listings in New Releases: {len(new)}")
+
+    # Prioritize club covers, but alert for EVERY new collection listing.
+    priority = {"Fairway": 0, "Hybrid": 1, "Mallet": 2, "Driver": 3, "Blade": 4}
+    new.sort(key=lambda p: (priority.get(category(p), 5), str(p.get("title", ""))))
+    for product in new:
+        notify(product)  # Failure prevents marking this product as notified.
+        seen_releases.add(str(product["id"]))
+        state["release_seen_ids"] = sorted(seen_releases)
+        state["seen_ids"] = sorted(seen_catalog | all_ids)
+        save_state(state)
+
+    state["release_seen_ids"] = sorted(seen_releases)
+    state["seen_ids"] = sorted(seen_catalog | all_ids)
+    save_state(state)
+
+
+if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        print(f'ERROR: {exc}', file=sys.stderr)
+        print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
